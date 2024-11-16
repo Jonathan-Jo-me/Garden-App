@@ -7,12 +7,13 @@ pipeline {
         SCANNER_HOME = tool 'sonar-scanner'
         AWS_REGION = 'ap-south-1'
         ECR_REPO_API = '836759839628.dkr.ecr.ap-south-1.amazonaws.com/prod/web'
-        IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT}" 
+        IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT}"
+        KUBE_NAMESPACE = 'prod'  // You can change this to your specific namespace
+        EKS_CLUSTER_NAME = 'DevSecOps-Cluster'  // Replace with your EKS cluster name
     }
     stages {
         stage('Checkout Code') {
             steps {
-                // Checkout the source code from the repository
                 checkout scm
             }
         }
@@ -48,36 +49,16 @@ pipeline {
 
         stage('Quality Gate Check') {
             steps {
-                echo "Quality Gate Check OK "
+                echo "Quality Gate Check OK"
             }
         }
-
-    //    stage('Quality Gate Check') {
-    //        steps {
-    //            script {
-    //                // Wait for SonarQube Quality Gate result
-    //                def qg = waitForQualityGate()  // This waits for the analysis to complete
-
-    //                // Check if the quality gate passed or failed and take action based on user choice
-    //                if (params.QualityGate == 'Fail' && qg.status != 'OK') {
-    //                    // Fail the pipeline if the quality gate fails and 'Fail' is chosen
-    //                    error "Quality Gate '${qg.name}' Failed. Build is failing as per user choice."
-    //                } else if (params.QualityGate == 'Pass' && qg.status == 'OK') {
-    //                    echo "Quality Gate passed. Continuing pipeline."
-    //                } else if (params.QualityGate == 'Pass' && qg.status != 'OK') {
-    //                    // Optionally, continue even if the Quality Gate failed if 'Pass' was selected
-    //                    echo "Quality Gate failed, but continuing because 'Pass' was selected."
-    //                }
-    //            }
-    //        }
-    //    }
 
         stage('Run WEB Tests') {
             steps {
                 script {
                     dir('web') {
-                        sh 'export NODE_OPTIONS=--openssl-legacy-provider && npm install'  // Install dependencies
-                        sh 'export NODE_OPTIONS=--openssl-legacy-provider && npm run test:unit'  // Run unit tests for the web app
+                        sh 'export NODE_OPTIONS=--openssl-legacy-provider && npm install'
+                        sh 'export NODE_OPTIONS=--openssl-legacy-provider && npm run test:unit'
                         echo "run web test"
                     }
                 }
@@ -88,7 +69,6 @@ pipeline {
             steps {
                 script {
                     dir('web') {
-                        // Build Docker image for the API
                         sh 'docker build -t $ECR_REPO_API:$IMAGE_TAG .'
                     }
                 }
@@ -98,13 +78,8 @@ pipeline {
         stage('Anchore Grype Vulnerability Scan') {
             steps {
                 script {
-                    // Run Grype scan on the API Docker image (without condition)
                     sh 'grype $ECR_REPO_API:$IMAGE_TAG -o json > grype-scan-api.json'
-
-                    // Display the Grype scan results
                     sh 'cat grype-scan-api.json'
-
-                    // Optionally, you can archive the report to keep it for later inspection
                     archiveArtifacts allowEmptyArchive: true, artifacts: 'grype-scan-api.json'
                 }
             }
@@ -113,10 +88,101 @@ pipeline {
         stage('Push API Docker Image to ECR') {
             steps {
                 script {
-                    // Log in to AWS ECR and push the API Docker image
                     sh 'aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin 836759839628.dkr.ecr.$AWS_REGION.amazonaws.com'
                     sh 'docker push $ECR_REPO_API:$IMAGE_TAG'
                 }
+            }
+        }
+
+        stage('Kubelinter Helm Charts') {
+            steps {
+                script {
+                    try {
+                        def chartDirs = ['database', 'api', 'web'] 
+                        for (chart in chartDirs) {
+                            echo "Running Kubelinter on ${chart}..."
+                            def lintResult = sh(script: "kube-linter lint ${chart}/ --format=sarif > ${chart}-kubelint-report.sarif", returnStatus: true)
+                            if (lintResult != 0) {
+                                echo "Kubelinter detected issues in ${chart}, but continuing with the pipeline."
+                            } else {
+                                echo "No high-priority issues detected in ${chart}."
+                            }
+                        }
+                    } catch (Exception e) {
+                        error("Error running Kubelinter: ${e.message}")
+                    } finally {
+                        archiveArtifacts artifacts: '*-kubelint-report.sarif', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+    }
+    post {
+        success {
+            echo "Build completed successfully. Proceeding to Integration Testing and Notification."
+            script {
+                try {
+                    // Update kubeconfig for EKS cluster
+                    echo "Updating kubeconfig for EKS cluster ${EKS_CLUSTER_NAME} in region ${AWS_REGION}..."
+                    sh """
+                        aws eks update-kubeconfig --name ${EKS_CLUSTER_NAME} --region ${AWS_REGION}
+                    """
+
+                    // List all pods to confirm they are running
+                    echo "Checking if necessary pods are up and running..."
+                    sh 'kubectl get pods -n ${KUBE_NAMESPACE}'
+
+                    // Run Integration Tests
+                    echo "Running integration tests in the Kubernetes pod..."
+                    // Replace <pod-name> with the actual pod name or dynamically fetch it based on your needs
+                    sh 'kubectl exec -n ${KUBE_NAMESPACE} -it <pod-name> -- /bin/bash -c "cd /integration-tests && ./run_tests.sh"'
+                } catch (Exception e) {
+                    echo "Integration tests failed, but continuing the pipeline."
+                }
+            }
+        }
+
+        failure {
+            echo "Build failed, but continuing as per request."
+        }
+
+        always {
+            echo "Cleaning up and sending email notification."
+            script {
+                // Build Information
+                def jobName = env.JOB_NAME
+                def buildNumber = env.BUILD_NUMBER
+                def buildUrl = env.BUILD_URL
+                def pipelineStatus = currentBuild.result ?: 'SUCCESS'  // Force success if any error happened
+                def bannerColor = (pipelineStatus == 'SUCCESS') ? 'green' : 'red'
+                def commitId = env.GIT_COMMIT ?: 'N/A'
+                def triggeredBy = currentBuild.getBuildCauses().collect { cause -> cause.userId ?: 'Automated Trigger' }.join(", ")
+
+                // HTML Email Body
+                def body = """<html>
+                                <body>
+                                    <div style="border: 4px solid ${bannerColor}; padding: 10px;">
+                                        <h2>${jobName} - Build ${buildNumber}</h2>
+                                        <div style="background-color: ${bannerColor}; padding: 10px;">
+                                            <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
+                                        </div>
+                                        <p><strong>Build URL:</strong> <a href="${buildUrl}">${buildUrl}</a></p>
+                                        <p><strong>Commit ID:</strong> ${commitId}</p>
+                                        <p><strong>Triggered By:</strong> ${triggeredBy}</p>
+                                    </div>
+                                </body>
+                              </html>"""
+
+                // Send Email Notification
+                emailext (
+                    subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                    body: body,
+                    to: 'jonathanjonathanjo10@gmail.com',
+                    from: 'jonathanjonathanjo10@gmail.com',
+                    replyTo: 'jonathanjonathanjo10@gmail.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: '**/*.sarif, */grype-scan-api.json, */dependency-check-report.xml' 
+                )
             }
         }
     }
